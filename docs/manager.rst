@@ -55,6 +55,12 @@ also enables initial retries. After a successful TCP connection, unexpected
 connection loss always retries at ``reconnect_timeout`` intervals until closed.
 Concurrent ``connect()`` calls share the same pending connection attempt.
 
+Actions submitted while reconnecting are queued and sent after the new server
+session emits ``FullyBooted``. Forgettable actions such as Ping and Login fail
+with ``ConnectionError`` while disconnected. Permanent ``close()`` cancels
+outstanding action futures and clears the queue; submitting new actions to a
+closed manager raises ``ConnectionError``.
+
 Ping starts after Login succeeds (or immediately if no username is configured).
 A rejected Login or MD5 Challenge logs an error with the host, port and username,
 closes the manager permanently, and calls ``on_disconnect(manager, exc)`` with a

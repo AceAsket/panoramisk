@@ -17,11 +17,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Pull images
-        run: docker-compose -f tests/docker/docker-compose.yml pull
+        run: docker compose -f tests/docker/docker-compose.yml pull
       - name: Install Tox and any other packages
         run: pip install tox
       - name: Run Tox
         run: tox -e py
+        env:
+          PANORAMISK_REQUIRE_DOCKER: "1"
       - name: Run flake8 / docs
         run: tox -e flake8,docs
         if: "matrix.python == '3.10' || matrix.python == '3.11' || matrix.python == '3.12'"

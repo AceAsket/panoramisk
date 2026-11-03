@@ -1,0 +1,2 @@
+tests/fixtures/*.yaml text eol=lf
+tests/docker/*.sh text eol=lf

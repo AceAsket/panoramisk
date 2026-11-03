@@ -27,6 +27,13 @@ class AMIProtocol(asyncio.Protocol):
                 klass = actions.Action
             data = klass(data, as_list=as_list)
         data.as_list = as_list
+        if self.closed:
+            if (self.factory is None or self.factory._closed or
+                    data['action'].lower() in self.factory.forgetable_actions):
+                raise ConnectionError('AMI connection is closed')
+            if not data.done() and not any(action is data for action in self.factory.awaiting_actions):
+                self.factory.awaiting_actions.append(data)
+            return data
         self.responses[data.id] = data
         if data.action_id:
             self.responses[data.action_id] = data

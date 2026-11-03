@@ -1,15 +1,13 @@
 ---
 
-version: "3"
-
 services:
 
     asterisk:
-        image: andrius/asterisk:latest
+        image: ${PANORAMISK_ASTERISK_IMAGE:-andrius/asterisk:latest}
         ports:
-            - 5038:5038
-            - 5060:5060/udp
-            - 5060:5060/tcp
+            - "127.0.0.1:${PANORAMISK_AMI_PORT:-5038}:5038"
         volumes:
-            - ./:/opt
-        entrypoint: /opt/docker-entrypoint.sh
+            - ./etc/manager.conf:/etc/asterisk/manager.conf:ro
+            - ./etc/modules.conf:/etc/asterisk/modules.conf:ro
+        entrypoint: ["/usr/sbin/asterisk", "-f", "-vvv"]
+        command: []

@@ -436,3 +436,61 @@ def test_protocol_can_disconnect_before_factory_is_attached():
     protocol.connection_lost(None)
     assert protocol.closed
     transport.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_action_during_reconnect_is_sent_on_new_connection(event_loop, managers, monkeypatch):
+    first, second = connection(), connection()
+    mock_connections(monkeypatch, event_loop, iter([first, second]))
+    manager = managers(reconnect_timeout=10)
+    await manager.connect()
+    first[1].connection_lost(OSError())
+    first[0].write.reset_mock()
+    action = manager.send_action({'Action': 'Status'})
+    manager.send_action(action)
+    assert list(manager.awaiting_actions) == [action]
+    first[0].write.assert_not_called()
+
+    await manager.send_awaiting_actions()
+    assert list(manager.awaiting_actions) == [action]
+    await manager.connect()
+    await manager.send_awaiting_actions()
+    assert not manager.awaiting_actions
+    assert second[0].write.call_count == 1
+    assert b'Action: Status' in second[0].write.call_args[0][0]
+    second[1].handle_message(Message({'Response': 'Success', 'ActionID': action.id}))
+    assert (await action).success
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('disconnected', [False, True])
+async def test_close_cancels_outstanding_actions(event_loop, managers, monkeypatch, disconnected):
+    transport, protocol = connection()
+    mock_connections(monkeypatch, event_loop, iter([(transport, protocol)]))
+    manager = managers(reconnect_timeout=10)
+    await manager.connect()
+    in_flight = manager.send_action({'Action': 'Status'})
+    if disconnected:
+        protocol.connection_lost(OSError())
+    pending = manager.send_action({'Action': 'QueueStatus'})
+    manager.close()
+    assert in_flight.cancelled()
+    assert pending.cancelled()
+    assert not manager.awaiting_actions
+    with pytest.raises(ConnectionError, match='closed'):
+        manager.send_action({'Action': 'Status'})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['Ping', 'Login'])
+async def test_forgettable_actions_fail_while_disconnected(event_loop, managers, monkeypatch, action):
+    transport, protocol = connection()
+    mock_connections(monkeypatch, event_loop, iter([(transport, protocol)]))
+    manager = managers(reconnect_timeout=10)
+    await manager.connect()
+    protocol.connection_lost(OSError())
+    transport.write.reset_mock()
+    with pytest.raises(ConnectionError, match='closed'):
+        manager.send_action({'Action': action})
+    assert not manager.awaiting_actions
+    transport.write.assert_not_called()

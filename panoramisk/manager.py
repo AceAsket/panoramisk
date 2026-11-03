@@ -88,7 +88,7 @@ class Manager:
                 return
             self._cancel_authentication()
             self._stop_pinger()
-            if self.protocol is not None:
+            if self.protocol is not None and self.protocol is not protocol:
                 self.protocol.close()
             self._connected = True
             self._ever_connected = True
@@ -211,7 +211,8 @@ class Manager:
 
     async def send_awaiting_actions(self, *_):
         self.log.info('Sending awaiting actions')
-        while self.awaiting_actions:
+        while (self.awaiting_actions and self._connected and not self._closed
+               and not self.protocol.closed):
             action = self.awaiting_actions.popleft()
             if action['action'].lower() not in self.forgetable_actions:
                 if not action.done():
@@ -244,6 +245,8 @@ class Manager:
         See https://wiki.asterisk.org/wiki/display/AST/AMI+Actions for
         more information on actions
         """
+        if self._closed:
+            raise ConnectionError('Manager is closed')
         action.update(kwargs)
         return self.protocol.send(action, as_list=as_list)
 
@@ -391,7 +394,14 @@ class Manager:
         self._stop_pinger()
         self._cancel_authentication()
         if getattr(self, 'protocol', None):
+            for action in list(self.protocol.responses.values()):
+                if not action.done():
+                    action.cancel()
             self.protocol.close()
+        while self.awaiting_actions:
+            action = self.awaiting_actions.popleft()
+            if not action.done():
+                action.cancel()
 
     def connection_lost(self, exc):
         if self._closed:

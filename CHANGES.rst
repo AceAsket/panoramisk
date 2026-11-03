@@ -17,6 +17,14 @@
 - Prevent recursive protocol shutdown and handle disconnects before the manager
   is attached to the protocol.
 
+- Queue actions submitted during reconnect instead of writing to the closed
+  transport. Cancel outstanding actions on permanent close, and reject new
+  actions sent after close. Ping/Login fail immediately while disconnected.
+
+- Run the Asterisk integration test with Docker Compose v2, isolated loopback
+  ports, bounded startup/reconnect waits and guaranteed cleanup. CI requires this
+  test instead of silently skipping it when Compose is unavailable.
+
 
 1.4 (2021-08-05)
 ----------------
