@@ -3,6 +3,7 @@ from panoramisk import Manager
 
 manager = Manager(loop=asyncio.get_event_loop(),
                   host='127.0.0.1',
+                  reconnect_on_failure=True,
                   username='user',
                   secret='mysecret')
 

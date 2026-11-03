@@ -3,6 +3,20 @@
 
 - Action is now both a Future and an async iterator
 
+- Make ``Manager.close()`` terminal: cancel reconnect timers, pending connection
+  attempts and authentication, and close connections that complete after shutdown.
+
+- Return initial connection failures without background retries by default.
+  Set ``reconnect_on_failure=True`` to keep retrying from startup;
+  ``connect(run_forever=True)`` also enables these retries. Unexpected connection
+  loss after a successful connection still reconnects automatically.
+
+- Close and log rejected Login/MD5 Challenge sessions, notify ``on_disconnect``
+  with a ``PermissionError``, and only start Ping after authentication succeeds.
+
+- Prevent recursive protocol shutdown and handle disconnects before the manager
+  is attached to the protocol.
+
 
 1.4 (2021-08-05)
 ----------------

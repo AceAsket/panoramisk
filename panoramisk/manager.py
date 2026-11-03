@@ -31,6 +31,7 @@ class Manager:
         ping_delay=10,
         ping_interval=10,
         reconnect_timeout=2,
+        reconnect_on_failure=False,
         protocol_factory=AMIProtocol,
         save_stream=None,
         loop=None,
@@ -54,6 +55,11 @@ class Manager:
         self.ping_interval = int(self.config['ping_interval'])
         self.reconnect_timeout = int(self.config['reconnect_timeout'])
         self._connected = False
+        self._closed = False
+        self._ever_connected = False
+        self._connect_future = None
+        self._reconnect_handle = None
+        self._reconnect_on_failure = self.config['reconnect_on_failure']
         self.auth_type = self.config.get('auth_type')
         self.auth_challenge_future = None
         self.register_event('FullyBooted', self.send_awaiting_actions)
@@ -62,21 +68,32 @@ class Manager:
         self.on_disconnect = config.get('on_disconnect', on_disconnect)
 
     def connection_made(self, f):
-        if getattr(self, 'protocol', None):
-            self.protocol.close()
+        if f is self._connect_future:
+            self._connect_future = None
+        if f.cancelled():
+            return
         try:
             transport, protocol = f.result()
-        except OSError:  # pragma: no cover
-            if self._connected:
-                self.log.exception('Not able to connect')
-                self._connected = False
-            else:
-                self.log.warning('Not able to reconnect')
-            self.loop.call_later(self.reconnect_timeout, self.connect)
+        except OSError as exc:
+            if self._closed:
+                return
+            self._connected = False
+            self.log.warning('Not able to connect to %s:%s: %s',
+                             self.config['host'], self.config['port'], exc)
+            if self._ever_connected or self._reconnect_on_failure:
+                self._schedule_reconnect()
         else:
+            if self._closed:
+                protocol.close()
+                return
+            self._cancel_authentication()
+            self._stop_pinger()
+            if self.protocol is not None:
+                self.protocol.close()
             self._connected = True
+            self._ever_connected = True
+            self.authenticated = False
             self.log.debug('Manager connected')
-            self.loop.call_soon(self.on_connect, self)
             self.protocol = protocol
             self.protocol.queue = deque()
             self.protocol.factory = self
@@ -84,6 +101,7 @@ class Manager:
             self.protocol.config = self.config
             self.protocol.encoding = self.encoding = self.config['encoding']
             self.responses = self.protocol.responses = {}
+            self.loop.call_soon(self._run_callback, self.on_connect, protocol)
             if 'username' in self.config:
                 if self.auth_type is not None:
                     if self.auth_type.lower() == 'md5':
@@ -101,11 +119,57 @@ class Manager:
                 self.authenticated_future.add_done_callback(self.login)
             else:
                 self.log.debug('username not in config file')
-            self.pinger = self.loop.call_later(self.ping_delay, self.ping)
+                self.pinger = self.loop.call_later(self.ping_delay, self.ping)
+
+    def _run_callback(self, callback, protocol):
+        if not self._closed and self._connected and protocol is self.protocol:
+            callback(self)
+
+    def _schedule_reconnect(self):
+        if not self._closed and self._reconnect_handle is None:
+            self._reconnect_handle = self.loop.call_later(
+                self.reconnect_timeout, self._reconnect)
+
+    def _reconnect(self):
+        self._reconnect_handle = None
+        if not self._closed:
+            self.connect()
+
+    def _stop_pinger(self):
+        if self.pinger is not None:
+            self.pinger.cancel()
+            self.pinger = None
+
+    def _cancel_authentication(self):
+        for name, callback in (('authenticated_future', self.login),
+                               ('auth_challenge_future', self.secure_login)):
+            future = getattr(self, name)
+            if future is not None:
+                future.remove_done_callback(callback)
+                if not future.done():
+                    future.cancel()
+                elif not future.cancelled():
+                    future.exception()
+                setattr(self, name, None)
+
+    def _authentication_failed(self, stage):
+        exc = PermissionError('AMI %s failed for %s:%s (user=%s)' % (
+            stage, self.config['host'], self.config['port'],
+            self.config.get('username', '')))
+        self.log.error('%s', exc)
+        self.close()
+        self.loop.call_soon(self.on_disconnect, self, exc)
 
     def secure_login(self, future):
-        resp = future.result()
-        if bool(resp.success):
+        if self._closed or future.cancelled():
+            return
+        self.auth_challenge_future = None
+        try:
+            resp = future.result()
+        except Exception:
+            self._authentication_failed('MD5 challenge')
+            return
+        if resp.success and resp.Challenge:
             auth_challenge = resp.Challenge + self.config['secret']
             key = hashlib.md5(auth_challenge.encode('utf-8')).hexdigest()
             self.authenticated = False
@@ -116,19 +180,32 @@ class Manager:
                 'Key': key,
                 'Events': self.config['events']})
             self.authenticated_future.add_done_callback(self.login)
+        else:
+            self._authentication_failed('MD5 challenge')
 
     def login(self, future):
+        if self._closed or future.cancelled():
+            return False
         self.authenticated_future = None
-        resp = future.result()
+        try:
+            resp = future.result()
+        except Exception:
+            self._authentication_failed('login')
+            return False
         self.authenticated = bool(resp.success)
+        self._stop_pinger()
         if self.authenticated:
-            self.loop.call_soon(self.on_login, self)
-        if self.pinger is not None:
-            self.pinger.cancel()
-        self.pinger = self.loop.call_later(self.ping_delay, self.ping)
+            self.loop.call_soon(self._run_callback, self.on_login, self.protocol)
+            self.pinger = self.loop.call_later(self.ping_delay, self.ping)
+        else:
+            self._authentication_failed('login')
         return self.authenticated
 
-    def ping(self):  # pragma: no cover
+    def ping(self):
+        self._stop_pinger()
+        if (self._closed or not self._connected or
+                ('username' in self.config and not self.authenticated)):
+            return
         self.pinger = self.loop.call_later(self.ping_interval, self.ping)
         self.protocol.send({'Action': 'Ping'})
 
@@ -215,16 +292,29 @@ class Manager:
         return self.send_action(action)
 
     def connect(self, run_forever=False, on_startup=None, on_shutdown=None):
-        """connect to the server"""
+        """Connect to the server. A closed manager cannot be reused.
+
+        Initial failures are returned to the caller without background retries,
+        unless ``reconnect_on_failure=True`` or ``run_forever=True`` is used.
+        Once connected, unexpected connection loss is retried automatically.
+        """
+        if self._closed:
+            raise RuntimeError('Manager is closed; create a new Manager to connect')
         if self.loop is None:  # pragma: no cover
             self.loop = asyncio.get_event_loop()
-        t = asyncio.ensure_future(
-            self.loop.create_connection(
-                self.config['protocol_factory'],
-                self.config['host'], self.config['port'],
-                ssl=self.config['ssl']),
-        )
-        t.add_done_callback(self.connection_made)
+        if run_forever:
+            self._reconnect_on_failure = True
+        if self._reconnect_handle is not None:
+            self._reconnect_handle.cancel()
+            self._reconnect_handle = None
+        if self._connect_future is None:
+            self._connect_future = asyncio.ensure_future(
+                self.loop.create_connection(
+                    self.config['protocol_factory'],
+                    self.config['host'], self.config['port'],
+                    ssl=self.config['ssl']), loop=self.loop)
+            self._connect_future.add_done_callback(self.connection_made)
+        t = self._connect_future
 
         if run_forever:
             self.run_forever(on_startup, on_shutdown)
@@ -289,22 +379,32 @@ class Manager:
         return matches
 
     def close(self):
-        """Close the connection"""
-        if self.pinger:
-            self.pinger.cancel()
-            self.pinger = None
+        """Permanently close the manager and cancel connection attempts."""
+        self._closed = True
+        self._connected = False
+        self.authenticated = False
+        if self._reconnect_handle is not None:
+            self._reconnect_handle.cancel()
+            self._reconnect_handle = None
+        if self._connect_future is not None and not self._connect_future.done():
+            self._connect_future.cancel()
+        self._stop_pinger()
+        self._cancel_authentication()
         if getattr(self, 'protocol', None):
             self.protocol.close()
 
     def connection_lost(self, exc):
+        if self._closed:
+            return
         self._connected = False
-        self.log.error('Connection lost')
+        self.authenticated = False
+        self._cancel_authentication()
+        self._stop_pinger()
+        self.log.error('Connection lost from %s:%s',
+                       self.config['host'], self.config['port'])
         self.loop.call_soon(self.on_disconnect, self, exc)
-        if self.pinger:
-            self.pinger.cancel()
-            self.pinger = None
         self.log.info('Try to connect again in %d second(s)' % self.reconnect_timeout)
-        self.loop.call_later(self.reconnect_timeout, self.connect)
+        self._schedule_reconnect()
 
     @classmethod
     def from_config(cls, filename_or_fd, section='asterisk', **kwargs):

@@ -89,7 +89,8 @@ class AMIProtocol(asyncio.Protocol):
     def connection_lost(self, exc):
         if not self.closed:
             self.close()
-            self.factory.connection_lost(exc)
+            if self.factory is not None:
+                self.factory.connection_lost(exc)
 
     def close(self):
         if self.factory and self.responses:
@@ -110,7 +111,5 @@ class AMIProtocol(asyncio.Protocol):
                     self.log.info('Adding action "%s" to awaiting list: %s', action['action'].lower(), str(action))
                     awaiting_actions.append(action)
         if not self.closed:
-            try:
-                self.transport.close()
-            finally:
-                self.closed = True
+            self.closed = True
+            self.transport.close()

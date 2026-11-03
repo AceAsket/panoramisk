@@ -8,8 +8,8 @@ version = '1.5.dev0'
 
 install_requires = []
 test_requires = [
-    'pytest',
-    'pytest-asyncio',
+    'pytest>=7,<8',
+    'pytest-asyncio>=0.21,<0.22',
     'coverage',
     'coveralls',
 ]
