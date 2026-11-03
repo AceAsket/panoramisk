@@ -224,15 +224,26 @@ async def test_concurrent_connect_calls_share_one_attempt(event_loop, managers, 
 
 
 @pytest.mark.asyncio
-async def test_pending_login_does_not_ping_and_success_starts_ping(event_loop, managers, monkeypatch):
+@pytest.mark.parametrize('auth_type', [None, 'md5'])
+async def test_pending_login_does_not_ping_and_success_starts_ping(
+        event_loop, managers, monkeypatch, auth_type):
     transport, protocol = connection()
     mock_connections(monkeypatch, event_loop, iter([(transport, protocol)]))
     logged_in = Mock()
-    manager = managers(username='user', secret='secret', on_login=logged_in)
+    manager = managers(username='user', secret='secret', auth_type=auth_type, on_login=logged_in)
     await manager.connect()
     assert manager.pinger is None
     manager.ping()
-    assert transport.write.call_count == 1  # Login only.
+    assert transport.write.call_count == 1  # Login or MD5 Challenge only.
+    if auth_type == 'md5':
+        manager.auth_challenge_future.set_result(Message({'Response': 'Success', 'Challenge': '123'}))
+        await drain_loop()
+        assert manager.pinger is None
+        manager.ping()
+        assert transport.write.call_count == 2  # Challenge and Login only.
+        request = transport.write.call_args[0][0]
+        assert b'AuthType: MD5' in request
+        assert b'Secret:' not in request
     manager.authenticated_future.set_result(Message({'Response': 'Success'}))
     await drain_loop()
     logged_in.assert_called_once_with(manager)
@@ -290,6 +301,50 @@ async def test_close_cancels_pending_authentication(event_loop, managers, monkey
     await drain_loop()
     assert future.cancelled()
     assert transport.write.call_count == 1
+    assert manager.pinger is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('md5', [False, True])
+async def test_close_before_queued_authentication_response(event_loop, managers, monkeypatch, md5):
+    transport, protocol = connection()
+    mock_connections(monkeypatch, event_loop, iter([(transport, protocol)]))
+    logged_in = Mock()
+    manager = managers(username='user', secret='secret', auth_type='md5' if md5 else None, on_login=logged_in)
+    await manager.connect()
+    future = manager.auth_challenge_future if md5 else manager.authenticated_future
+    future.set_result(Message({'Response': 'Success', 'Challenge': '123'}))
+    manager.close()
+    await drain_loop()
+    assert manager.authenticated is False
+    assert manager.pinger is None
+    assert manager.authenticated_future is None
+    assert manager.auth_challenge_future is None
+    assert transport.write.call_count == 1
+    transport.close.assert_called_once()
+    logged_in.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_connect_does_not_retry_or_raise_in_callback(event_loop, managers, monkeypatch):
+    calls = Mock()
+    started = event_loop.create_future()
+
+    async def create_connection(*args, **kwargs):
+        calls()
+        started.set_result(None)
+        await event_loop.create_future()
+
+    monkeypatch.setattr(event_loop, 'create_connection', create_connection)
+    manager = managers(reconnect_on_failure=True)
+    future = manager.connect()
+    await started
+    future.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await future
+    await drain_loop()
+    calls.assert_called_once()
+    assert manager.protocol is None
     assert manager.pinger is None
 
 
